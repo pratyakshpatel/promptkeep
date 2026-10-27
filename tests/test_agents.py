@@ -649,3 +649,16 @@ class TestSamplingAndPayloads:
         root = history.trace(task.trace_key).root
         assert root.input is history._UNSET
         assert root.status == "ok"
+
+
+def test_inherited_scope_is_ignored_after_process_change(monkeypatch):
+    """An inherited frame cannot attach child work to the parent's trace."""
+    with promptkeep.agent("parent") as parent:
+        pid = os.getpid()
+        with monkeypatch.context() as patch:
+            patch.setattr(agents.os, "getpid", lambda: pid + 1)
+            assert agents.current() is None
+            with pytest.raises(RuntimeError, match="inside an agent"):
+                with promptkeep.tool("child"):
+                    pass
+        assert agents.current().span_key == parent.span_key

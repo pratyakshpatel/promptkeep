@@ -1,6 +1,6 @@
 # Agent tracing implementation plan
 
-Status: proposed; documentation only. No implementation is authorized by this document.
+Status: Slice A implemented; Slices B and C remain optional follow-ups. This document preserves the original design and acceptance criteria.
 Prepared: 25 October 2026.
 Repository: PromptKeep.
 Planning baseline: the local source inspected for this proposal; schema version 8.
@@ -847,8 +847,7 @@ Use current template escaping; do not render tool output as trusted HTML.
 
 ## 13. Verification plan
 
-This section describes future implementation verification. Creating this Markdown document
-does not require running the application or the test suite.
+This section describes the verification targets for implementation and review.
 
 Follow existing test fixtures, temporary databases, fakes, and real-SDK mock transport tests.
 
@@ -1087,7 +1086,7 @@ first try an existing mechanism, then revise this plan.
 ### 16.2 Code size budget
 
 Aim for roughly 400-700 net production Python lines for Slice A.
-Treat growth beyond roughly 900 net production lines as a scope-review trigger.
+Treat growth beyond roughly 900 net production lines as a scope-review trigger. Slice A exceeds this trigger: review the trace lifecycle, history projections, sampling, retention, and queue integration together before merge.
 Tests, docs, and examples are separate from that review signal.
 
 This is a planning target, not a source-size prediction. Do not compress code, remove

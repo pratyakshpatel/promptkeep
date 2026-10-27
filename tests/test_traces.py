@@ -541,3 +541,22 @@ class TestSamplingPolicy:
         trace = history.trace(task.trace_key)
         assert trace.root.name == "[X] agent"
         assert "[X] error" in trace.root.error
+
+
+def test_trace_reads_are_batched(monkeypatch):
+    """Reading many spans does not issue one query per span."""
+    trace_key = _root()
+    for _ in range(25):
+        _run(_model(trace_key, trace_key))
+    database = storage.get_db().obj
+    original = database.execute_sql
+    queries = []
+
+    def count(sql, *args, **kwargs):
+        queries.append(sql)
+        return original(sql, *args, **kwargs)
+
+    monkeypatch.setattr(database, "execute_sql", count)
+    result = history.trace(trace_key)
+    assert len(result.spans) == 26
+    assert len(queries) <= 4
