@@ -361,3 +361,32 @@ class TestWrappingTheClass:
         result = promptkeep.call(client, model="gpt-5.5", instructions=SYSTEM, input="hi")
         assert result.text == "answer resp_1"
         assert promptkeep.call(client, model="m", messages=MESSAGES).text == "Lima"
+
+
+class TestAgentSpans:
+    """Agent association against real OpenAI SDK objects and decorators."""
+
+    def test_real_sync_chat_call_is_linked_to_agent_trace(self, client):
+        with promptkeep.agent("real-chat") as task:
+            response = client.chat.completions.create(model="m", messages=MESSAGES)
+
+        trace = history.trace(task.trace_key)
+        (span,) = [item for item in trace.spans if item.kind == "llm"]
+        assert response.promptkeep.span_key == span.span_key
+        assert span.runs[0].provider == "openai"
+        assert span.runs[0].output_text == "Lima"
+
+    def test_real_async_responses_call_is_linked_to_agent_trace(self, async_client):
+        async def go():
+            async with promptkeep.agent("real-responses") as task:
+                response = await async_client.responses.create(
+                    model="gpt-5.5", instructions=SYSTEM, input="Peru?"
+                )
+            return task.trace_key, response
+
+        trace_key, response = asyncio.run(go())
+        trace = history.trace(trace_key)
+        (span,) = [item for item in trace.spans if item.kind == "llm"]
+        assert response.promptkeep.span_key == span.span_key
+        assert span.runs[0].provider == "openai-responses"
+        assert span.runs[0].output_text == "answer resp_1"

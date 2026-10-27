@@ -9,6 +9,7 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _distribution_version
 
 from . import history
+from .agents import agent, tool
 from .checks import CheckContext, PromptBlocked, Verdict, check, suppress
 from .config import configure, get_settings
 from .conversation import conversation
@@ -35,6 +36,8 @@ __all__ = [
     "get_settings",
     "history",
     "conversation",
+    "agent",
+    "tool",
     "dataset",
     "Dataset",
     "flush",

@@ -1,10 +1,11 @@
 """The SQLite tables, as peewee models.
 
-Four entities: a prompt's identity, its versions (the lineage), the runs
-that executed a version and/or belong to a conversation, and the check
-verdicts recorded against a run. The models bind to ``db_proxy``, which
-``storage.get_db()`` points at the configured file on first use — nothing
-here touches a database at import time.
+Five entities: a prompt's identity, its versions (the lineage), the runs
+that executed a version and/or belong to a conversation, the check verdicts
+recorded against a run, and the spans of an explicitly instrumented agent
+trace. The models bind to ``db_proxy``, which ``storage.get_db()`` points at
+the configured file on first use — nothing here touches a database at import
+time.
 """
 
 from __future__ import annotations
@@ -136,6 +137,10 @@ class RunRecord(BaseModel):
     input_text = pw.TextField(null=True)
     original_input_text = pw.TextField(null=True)
     parent_run_key = pw.TextField(null=True)
+    # The model span this row belongs to. A physical call that carries more
+    # than one Prompt writes several runs; they all share this key. NULL for
+    # every run recorded outside an agent trace and for historical rows.
+    span_key = pw.TextField(null=True)
 
     class Meta:
         """Table name and the indexes reads depend on."""
@@ -148,6 +153,8 @@ class RunRecord(BaseModel):
             (("response_id",), False),
             # A run's children, for walking a conversation tree downwards.
             (("parent_run_key",), False),
+            # One trace read collects all model runs linked to its spans.
+            (("span_key",), False),
         )
 
 
@@ -179,9 +186,63 @@ class CheckRecord(BaseModel):
         indexes = ((("run", "name"), False),)
 
 
+class SpanRecord(BaseModel):
+    """One observed operation in an explicitly instrumented agent trace.
+
+    A span is either an agent scope, an application tool scope, or one
+    physical wrapped model call. The top-level agent span is the trace root:
+    its ``span_key`` and ``trace_key`` are the same. ``parent_span_key`` names
+    the enclosing scope at operation start; it is a key rather than a foreign
+    key because queued rows can outlive one another, exactly like a run's
+    parent. ``runs.span_key`` links the existing run rows for a model call.
+
+    ``sampled`` is the successful-span decision for this span. The root's
+    value is the trace cohort: False means the root cohort was dropped, which
+    is typical of a problem-only trace (an error or non-ok verdict was kept
+    even though successful steps were sampled out). A model span normally
+    inherits the trace cohort; an explicit
+    conversation override can carry that conversation's cohort instead.
+    ``input_json``/``output_json`` hold serialized agent/tool payloads; model
+    spans leave them NULL because their request and response already live on
+    the linked run rows.
+    """
+
+    span_key = pw.TextField(unique=True)
+    trace_key = pw.TextField()
+    parent_span_key = pw.TextField(null=True)
+    kind = pw.TextField()
+    name = pw.TextField()
+    started_at = pw.TextField()
+    ended_at = pw.TextField(null=True)
+    duration_ms = pw.IntegerField(null=True)
+    status = pw.TextField()
+    input_json = pw.TextField(null=True)
+    output_json = pw.TextField(null=True)
+    error = pw.TextField(null=True)
+    sampled = pw.BooleanField(null=True)
+
+    class Meta:
+        """Table name and the indexes the two trace reads need."""
+
+        table_name = "spans"
+        indexes = (
+            # One trace's ordered timeline.
+            (("trace_key", "started_at"), False),
+            # Root listing and whole-trace retention.
+            (("kind", "started_at"), False),
+        )
+
+
 # Creation order: parents before children, so a fresh file can be built in
 # one pass.
-MODELS = [PromptRecord, PromptVersionRecord, ConversationRecord, RunRecord, CheckRecord]
+MODELS = [
+    PromptRecord,
+    PromptVersionRecord,
+    ConversationRecord,
+    RunRecord,
+    CheckRecord,
+    SpanRecord,
+]
 
 
 def new_run_key() -> str:

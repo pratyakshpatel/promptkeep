@@ -31,15 +31,15 @@ def test_all_names_resolve():
 # breaking change that goes through a deprecation first.
 PUBLIC_TOP_LEVEL = {
     "Prompt", "RenderedText", "prompt", "wrap", "configure", "get_settings", "history",
-    "conversation", "dataset", "Dataset", "flush", "feedback", "check", "call", "acall",
-    "Verdict", "CheckContext", "PromptBlocked", "suppress", "extract_placeholders",
-    "MissingVariableError", "TemplateParseError", "__version__",
+    "conversation", "agent", "tool", "dataset", "Dataset", "flush", "feedback", "check",
+    "call", "acall", "Verdict", "CheckContext", "PromptBlocked", "suppress",
+    "extract_placeholders", "MissingVariableError", "TemplateParseError", "__version__",
 }  # fmt: skip
 PUBLIC_HISTORY = {
     "CheckInfo", "ConversationInfo", "ConversationSummary", "PromptSummary", "RunInfo",
-    "VersionInfo", "VersionStats", "all_runs", "checks", "conversation", "diff",
-    "format_cost", "labels", "list_conversations", "list_prompts", "runs", "stats",
-    "verdict", "versions",
+    "SpanInfo", "TraceInfo", "VersionInfo", "VersionStats", "all_runs", "checks",
+    "conversation", "diff", "format_cost", "labels", "list_conversations", "list_prompts",
+    "list_traces", "runs", "stats", "trace", "verdict", "versions",
 }  # fmt: skip
 PUBLIC_INTEGRATIONS = {
     "wrap", "call", "acall", "CallResult", "is_wrapped", "adapters", "register_adapter",

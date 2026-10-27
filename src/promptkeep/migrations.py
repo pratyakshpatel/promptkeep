@@ -14,10 +14,17 @@ from __future__ import annotations
 import peewee as pw
 import playhouse.migrate as pm
 
-from .models import MODELS, CheckRecord, ConversationRecord, PromptVersionRecord, new_run_key
+from .models import (
+    MODELS,
+    CheckRecord,
+    ConversationRecord,
+    PromptVersionRecord,
+    SpanRecord,
+    new_run_key,
+)
 from .rendering import template_hash
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 def migrate(database: pw.SqliteDatabase) -> None:
@@ -141,6 +148,19 @@ def migrate(database: pw.SqliteDatabase) -> None:
                 migrator.add_index("runs", ("parent_run_key",), False),
             )
             database.execute_sql("PRAGMA user_version = 8")
+
+    # v9: agent traces. Spans are their own table; a nullable runs.span_key
+    # links every Prompt row from one physical model call to its model span.
+    # Historical runs stay NULL: they were never observed inside a trace.
+    if user_version < 9:
+        with database.atomic():
+            database.create_tables([SpanRecord], safe=True)
+            migrator = pm.SqliteMigrator(database)
+            pm.migrate(
+                migrator.add_column("runs", "span_key", pw.TextField(null=True)),
+                migrator.add_index("runs", ("span_key",), False),
+            )
+            database.execute_sql("PRAGMA user_version = 9")
 
 
 def _has_column(database: pw.SqliteDatabase, table: str, column: str) -> bool:

@@ -2,8 +2,9 @@
 
 The tables live in ``models``, schema upgrades in ``migrations``, the read
 side in ``history``. This module owns the connection and the writes: version
-registration, conversation resolution, run and verdict recording, the
-batch insert the background writer drains into, and the retention sweep.
+registration, conversation resolution, run and verdict recording, span
+upserts, the batch insert the background writer drains into, and the
+retention sweep.
 
 All write paths that run implicitly (version registration on first render,
 run recording inside a wrapped call) are exception-shielded: a broken DB
@@ -32,6 +33,7 @@ from .models import (
     PromptRecord,
     PromptVersionRecord,
     RunRecord,
+    SpanRecord,
     db_proxy,
     new_run_key,
 )
@@ -482,6 +484,8 @@ def record_run(
     input_text: str | None = None,
     original_input_text: str | None = None,
     parent_run_key: str | None = None,
+    span_key: str | None = None,
+    cohort: bool | None = None,
     checks: list[dict[str, Any]] | None = None,
 ) -> str | None:
     """Record one run row, honoring the configured write_mode. Never raises.
@@ -492,7 +496,10 @@ def record_run(
     a failed redaction, or the write failed). The key is minted here when
     the caller didn't bring one, and it is valid the moment this returns: in
     background mode the row may still be in the queue, but the key already
-    names it.
+    names it. ``span_key`` links this row to its model span when the call
+    happened inside an explicit agent trace; ``cohort`` is that trace's
+    already-chosen successful-span decision, so a call outside a conversation
+    does not flip a second independent coin.
 
     "sync" inserts before returning; "background" builds the complete row
     (timestamps and turn number included — they must reflect *call* time,
@@ -550,12 +557,13 @@ def record_run(
             "input_text": input_text,
             "original_input_text": original_input_text,
             "parent_run_key": parent_run_key,
+            "span_key": span_key,
         }
         if checks:
             row["_checks"] = list(checks)
 
         # The production controls, before the row can reach a queue or a disk.
-        if not controls.keep_run(settings, row, conversation_id):
+        if not controls.keep_run(settings, row, conversation_id, cohort=cohort):
             return None
         if settings.redact is not None:
             try:
@@ -624,6 +632,76 @@ def record_check(run_key: str | None, check_row: dict[str, Any]) -> None:
         logger.warning("promptkeep: failed to record check", exc_info=True)
 
 
+def record_span(
+    *,
+    span_key: str,
+    trace_key: str,
+    parent_span_key: str | None,
+    kind: str,
+    name: str,
+    started_at: str,
+    ended_at: str | None = None,
+    duration_ms: int | None = None,
+    status: str = "running",
+    input_json: str | None = None,
+    output_json: str | None = None,
+    error: str | None = None,
+    sampled: bool | None = None,
+) -> None:
+    """Record one span, honoring the configured write_mode. Never raises.
+
+    The row is prepared here, redacted before it can reach the queue, and
+    then either handed to the existing writer or inserted directly. A span
+    upsert is keyed by ``span_key``: a root's final row can restore a start
+    row the queue dropped, and a terminal status can never regress to
+    ``running`` (see ``_insert_span``). A redaction failure drops the span
+    rather than storing its payload unredacted.
+    """
+    try:
+        settings = get_settings()
+        if not settings.enabled or settings.write_mode == "off":
+            return
+        item: dict[str, Any] = {
+            "_kind": "span",
+            "span_key": span_key,
+            "trace_key": trace_key,
+            "parent_span_key": parent_span_key,
+            "kind": kind,
+            "name": name,
+            "started_at": started_at,
+            "ended_at": ended_at,
+            "duration_ms": duration_ms,
+            "status": status,
+            "input_json": input_json,
+            "output_json": output_json,
+            "error": error,
+            "sampled": sampled,
+        }
+
+        # The production redaction hook, before the span can be queued.
+        if settings.redact is not None:
+            try:
+                item = controls.redact_span(settings.redact, item)
+            except Exception:
+                logger.warning(
+                    "promptkeep: redact hook failed — span dropped rather than stored unredacted",
+                    exc_info=True,
+                )
+                return
+
+        # Retention rides the write path, exactly as it does for runs.
+        _schedule_prune(settings)
+
+        if settings.write_mode == "background":
+            writer.submit(item)
+            return
+        if get_db() is None:
+            return
+        _insert_span(item)
+    except Exception:
+        logger.warning("promptkeep: failed to record span", exc_info=True)
+
+
 # --- retention --------------------------------------------------------------------
 
 # When the next sweep is due, per database (a time.monotonic() deadline). A
@@ -676,8 +754,11 @@ def prune(retention_days: float) -> int:
     activity is older than the cutoff, so a long-running session never loses
     its opening turns while it is still in use. A run outside any
     conversation (or whose conversation no longer exists) goes by its own
-    timestamp. Prompts and versions are never deleted: they are the code's
-    history, not the traffic's, and they hold no user data.
+    timestamp. Agent traces expire whole, based on their latest span or linked
+    run activity, so a recent child keeps its siblings and an abandoned
+    running root does not live forever. Prompts and versions are never
+    deleted: they are the code's history, not the traffic's, and they hold no
+    user data.
 
     Chunked, one IMMEDIATE transaction per chunk, so the write lock is never
     held for long. Deleting frees pages for SQLite to reuse; the file itself
@@ -709,10 +790,21 @@ def prune(retention_days: float) -> int:
             ConversationRecord.delete().where(ConversationRecord.id.in_(expired)).execute()
         _forget_conversations(expired)
 
-    # Runs that belong to no (surviving) conversation, by their own age.
-    unattached = RunRecord.conversation.is_null() | RunRecord.conversation.not_in(
-        ConversationRecord.select(ConversationRecord.id)
-    )
+    # Whole traces whose latest span or linked-run activity is older than the
+    # cutoff. This runs after conversation pruning: a conversation may take
+    # its model runs first, and the remaining spans stay readable until their
+    # own trace expires.
+    deleted += _expire_traces(cutoff)
+
+    # Runs that belong to no (surviving) conversation, by their own age. A
+    # run still linked to a surviving span is left for that trace's expiry,
+    # so ordinary pruning cannot cut a trace into pieces. A run whose span
+    # was never persisted (an orphan span key) is still eligible by age.
+    surviving_spans = SpanRecord.select(SpanRecord.span_key)
+    unattached = (
+        RunRecord.conversation.is_null()
+        | RunRecord.conversation.not_in(ConversationRecord.select(ConversationRecord.id))
+    ) & (RunRecord.span_key.is_null() | RunRecord.span_key.not_in(surviving_spans))
     while True:
         with db_proxy.atomic("IMMEDIATE"):
             expired = [
@@ -726,6 +818,87 @@ def prune(retention_days: float) -> int:
                 break
             CheckRecord.delete().where(CheckRecord.run.in_(expired)).execute()
             deleted += RunRecord.delete().where(RunRecord.id.in_(expired)).execute()
+    return deleted
+
+
+def _expire_traces(cutoff: str) -> int:
+    """Delete whole trace groups whose latest recorded activity is old.
+
+    A trace's activity is the newest span start/end or linked-run timestamp,
+    so a running root is not pinned forever and a recent model call keeps its
+    older siblings alive. Trace keys are walked in bounded chunks; each chunk
+    deletes its spans, linked runs and those runs' verdicts in one IMMEDIATE
+    transaction. Returns the number of run rows deleted, preserving prune()'s
+    run-count meaning.
+    """
+    deleted = 0
+    last_key: str | None = None
+    while True:
+        with db_proxy.atomic("IMMEDIATE"):
+            # One bounded page of trace keys, ordered so the walk advances
+            # even when none of them are old enough to expire.
+            query = SpanRecord.select(SpanRecord.trace_key).distinct()
+            if last_key is not None:
+                query = query.where(SpanRecord.trace_key > last_key)
+            trace_keys = [
+                key for (key,) in query.order_by(SpanRecord.trace_key).limit(_PRUNE_CHUNK).tuples()
+            ]
+            if not trace_keys:
+                break
+            last_key = trace_keys[-1]
+
+            # The newest span activity and linked-run activity per trace.
+            span_activity = {
+                trace_key: timestamp
+                for trace_key, timestamp in SpanRecord.select(
+                    SpanRecord.trace_key,
+                    pw.fn.MAX(pw.fn.COALESCE(SpanRecord.ended_at, SpanRecord.started_at)).alias(
+                        "last"
+                    ),
+                )
+                .where(SpanRecord.trace_key.in_(trace_keys))
+                .group_by(SpanRecord.trace_key)
+                .tuples()
+            }
+            run_activity = {
+                trace_key: timestamp
+                for trace_key, timestamp in RunRecord.select(
+                    SpanRecord.trace_key,
+                    pw.fn.MAX(RunRecord.created_at).alias("last"),
+                )
+                .join(SpanRecord, on=(RunRecord.span_key == SpanRecord.span_key))
+                .where(SpanRecord.trace_key.in_(trace_keys))
+                .group_by(SpanRecord.trace_key)
+                .tuples()
+            }
+
+            # A trace expires when both its spans and its runs are old.
+            expired = []
+            for trace_key in trace_keys:
+                activity = span_activity.get(trace_key)
+                run_timestamp = run_activity.get(trace_key)
+                if run_timestamp is not None and (activity is None or run_timestamp > activity):
+                    activity = run_timestamp
+                if activity is not None and activity < cutoff:
+                    expired.append(trace_key)
+            if not expired:
+                continue
+
+            # Delete the trace's model runs and their verdicts, then its spans.
+            linked_span_keys = SpanRecord.select(SpanRecord.span_key).where(
+                SpanRecord.trace_key.in_(expired)
+            )
+            run_ids = [
+                run_id
+                for (run_id,) in RunRecord.select(RunRecord.id)
+                .where(RunRecord.span_key.in_(linked_span_keys))
+                .tuples()
+            ]
+            for start in range(0, len(run_ids), _PRUNE_CHUNK):
+                chunk = run_ids[start : start + _PRUNE_CHUNK]
+                CheckRecord.delete().where(CheckRecord.run.in_(chunk)).execute()
+                deleted += RunRecord.delete().where(RunRecord.id.in_(chunk)).execute()
+            SpanRecord.delete().where(SpanRecord.trace_key.in_(expired)).execute()
     return deleted
 
 
@@ -771,7 +944,7 @@ def write_batch(items: list[dict[str, Any]]) -> None:
 
 def _persist(item: dict[str, Any]) -> None:
     """Apply one queued item: a run row (the default), a late check verdict,
-    or a run's adoption into a conversation.
+    a run's adoption into a conversation, or a span upsert.
 
     These are the dicts record_run/record_check/chain_conversation hand to the
     writer; in sync mode the same functions apply them directly. A ``_kind``
@@ -782,6 +955,8 @@ def _persist(item: dict[str, Any]) -> None:
         _insert_check(item)
     elif kind == "adopt":
         _adopt_run(item)
+    elif kind == "span":
+        _insert_span(item)
     else:
         _insert_run(item)
 
@@ -848,6 +1023,25 @@ def _insert_check(item: dict[str, Any]) -> None:
         return
     fields = {k: v for k, v in item.items() if k not in ("_kind", "run_key")}
     CheckRecord.create(run=run_id, **fields)
+
+
+def _insert_span(item: dict[str, Any]) -> None:
+    """Insert or update one span, never downgrading a terminal row to running.
+
+    A root's start row may be missing (the queue dropped it, or the span was
+    sampled out until a problem occurred); the final row then creates it.
+    If an out-of-order running row arrives after a terminal one, it is
+    ignored: a completed span must not start running again.
+    """
+    row = {key: value for key, value in item.items() if key != "_kind"}
+    existing = SpanRecord.get_or_none(span_key=row["span_key"])
+    if existing is None:
+        SpanRecord.create(**row)
+        return
+    if existing.status != "running" and row.get("status") == "running":
+        return
+    fields = {key: value for key, value in row.items() if key != "span_key"}
+    SpanRecord.update(**fields).where(SpanRecord.span_key == row["span_key"]).execute()
 
 
 def _adopt_run(item: dict[str, Any]) -> None:

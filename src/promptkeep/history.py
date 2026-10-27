@@ -1,5 +1,5 @@
-"""The read side: lineage, runs, conversations and verdicts as frozen
-dataclasses.
+"""The read side: lineage, runs, conversations, verdicts and agent traces as
+frozen dataclasses.
 
 Every query lives here, next to the type it produces. Reads raise normally —
 a broken query is a bug you want to see — but against a disabled tracker
@@ -11,7 +11,7 @@ from __future__ import annotations
 import difflib
 import json
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from itertools import groupby
 from typing import Any
@@ -19,7 +19,18 @@ from typing import Any
 import peewee as pw
 
 from . import storage
-from .models import CheckRecord, ConversationRecord, PromptRecord, PromptVersionRecord, RunRecord
+from .models import (
+    CheckRecord,
+    ConversationRecord,
+    PromptRecord,
+    PromptVersionRecord,
+    RunRecord,
+    SpanRecord,
+)
+
+# A span payload that was never recorded (SQLite NULL), as opposed to an
+# explicit JSON null. Kept private; the dataclass exposes it as the default.
+_UNSET = object()
 
 
 @dataclass(frozen=True)
@@ -76,6 +87,162 @@ class RunInfo:
     original_input_text: str | None = None
     cost_usd: float | None = None
     parent_run_key: str | None = None
+
+
+@dataclass(frozen=True)
+class SpanInfo:
+    """One recorded span: an agent scope, a tool scope, or a model call.
+
+    ``input``/``output`` use a private sentinel for "never recorded", which is
+    different from an explicitly recorded JSON ``null``. A payload that the
+    redaction hook made unparsable is returned as the redacted raw string, so
+    it stays inspectable instead of silently becoming empty. ``runs`` holds
+    the existing run rows linked to an ``llm`` span; a missing run row is
+    shown by ``run_unavailable`` rather than invented. ``sampled`` is this
+    span's successful-span decision; for a root it is the trace cohort.
+    """
+
+    span_key: str
+    trace_key: str
+    parent_span_key: str | None
+    kind: str
+    name: str | None
+    started_at: str
+    ended_at: str | None
+    duration_ms: int | None
+    status: str
+    error: str | None = None
+    input: Any = _UNSET
+    output: Any = _UNSET
+    sampled: bool | None = None
+    runs: list[RunInfo] = field(default_factory=list)
+    checks: list[CheckInfo] = field(default_factory=list)
+
+    @property
+    def duration_seconds(self) -> float | None:
+        """Elapsed seconds, or None while the span has no recorded duration."""
+        return None if self.duration_ms is None else self.duration_ms / 1000
+
+    @property
+    def primary_run(self) -> RunInfo | None:
+        """The run that carries this model span's checks and shared metrics."""
+        return self.runs[0] if self.runs else None
+
+    @property
+    def run_unavailable(self) -> bool:
+        """Whether an llm span's linked run row is missing (pruned or dropped)."""
+        return self.kind == "llm" and not self.runs
+
+
+@dataclass(frozen=True)
+class TraceInfo:
+    """One trace's ordered spans plus the linked run details.
+
+    ``root`` is None when the root start/final row is missing but children
+    survived; the spans are still returned so the partial execution is
+    inspectable. Model metrics count each llm span once, using its primary
+    run, so several Prompt rows from one physical call cannot multiply
+    tokens or cost. ``sampled`` is the root's cohort decision; False means the
+    root's cohort was dropped, which is typical of a problem-only trace but
+    can also happen when an explicit conversation override supplies a kept
+    model step.
+    """
+
+    trace_key: str
+    root: SpanInfo | None
+    spans: list[SpanInfo]
+
+    @property
+    def status(self) -> str | None:
+        """The root's own exit status, or None when the root row is missing."""
+        return self.root.status if self.root is not None else None
+
+    @property
+    def sampled(self) -> bool | None:
+        """The root cohort decision, or None when the root row is missing."""
+        return self.root.sampled if self.root is not None else None
+
+    @property
+    def duration(self) -> float:
+        """Observed wall interval from the earliest start to the latest end.
+
+        A running root with no completed children contributes its start only,
+        so an open trace is not reported as an ever-growing duration. This is
+        an interval, not the sum of overlapping child durations.
+        """
+        starts = [
+            parsed
+            for span in self.spans
+            if (parsed := _parse_timestamp(span.started_at)) is not None
+        ]
+        ends = [
+            parsed
+            for span in self.spans
+            if span.ended_at is not None and (parsed := _parse_timestamp(span.ended_at)) is not None
+        ]
+        if not starts:
+            return 0.0
+        return max(0.0, (max(ends) - min(starts)).total_seconds() if ends else 0.0)
+
+    @property
+    def model_calls(self) -> int:
+        """How many physical model calls the trace observed."""
+        return sum(1 for span in self.spans if span.kind == "llm")
+
+    @property
+    def total_tokens(self) -> int:
+        """Tokens from each model span's primary run, counted once per call."""
+        total = 0
+        for span in self.spans:
+            if span.kind != "llm" or span.primary_run is None:
+                continue
+            total += span.primary_run.total_tokens or 0
+        return total
+
+    @property
+    def total_cost(self) -> float | None:
+        """Known provider-reported dollars, or None when no call reported any."""
+        known = [
+            span.primary_run.cost_usd
+            for span in self.spans
+            if span.kind == "llm"
+            and span.primary_run is not None
+            and span.primary_run.cost_usd is not None
+        ]
+        return sum(known) if known else None
+
+    @property
+    def cost_complete(self) -> bool:
+        """Whether every observed model call has a known provider-reported cost."""
+        model_spans = [span for span in self.spans if span.kind == "llm"]
+        return bool(model_spans) and all(
+            span.primary_run is not None and span.primary_run.cost_usd is not None
+            for span in model_spans
+        )
+
+    @property
+    def error_count(self) -> int:
+        """Child failures and blocks, separate from the root's exit status."""
+        return sum(
+            1
+            for span in self.spans
+            if span.span_key != self.trace_key and span.status in ("error", "blocked")
+        )
+
+    @property
+    def versions_used(self) -> dict[str, list[int]]:
+        """Prompt versions driving this trace, in first-use order per name."""
+        used: dict[str, list[int]] = {}
+        for span in self.spans:
+            if span.kind != "llm":
+                continue
+            for run in span.runs:
+                if run.prompt_name is None or run.version is None:
+                    continue
+                versions = used.setdefault(run.prompt_name, [])
+                if run.version not in versions:
+                    versions.append(run.version)
+        return used
 
 
 @dataclass(frozen=True)
@@ -500,6 +667,41 @@ def _run_info(row: dict[str, Any]) -> RunInfo:
     )
 
 
+def _span_info(
+    row: dict[str, Any],
+    runs: list[RunInfo] | None = None,
+    checks: list[CheckInfo] | None = None,
+) -> SpanInfo:
+    """One span row as a SpanInfo, decoding payloads without losing raw text."""
+    return SpanInfo(
+        span_key=row["span_key"],
+        trace_key=row["trace_key"],
+        parent_span_key=row.get("parent_span_key"),
+        kind=row["kind"],
+        name=row.get("name"),
+        started_at=row["started_at"],
+        ended_at=row.get("ended_at"),
+        duration_ms=row.get("duration_ms"),
+        status=row["status"],
+        error=row.get("error"),
+        input=_decode_span_payload(row.get("input_json")),
+        output=_decode_span_payload(row.get("output_json")),
+        sampled=None if row.get("sampled") is None else bool(row["sampled"]),
+        runs=runs or [],
+        checks=checks or [],
+    )
+
+
+def _decode_span_payload(value: str | None) -> Any:
+    """Decode a stored span payload; NULL is unset, unparsable text is kept."""
+    if value is None:
+        return _UNSET
+    try:
+        return json.loads(value)
+    except (ValueError, TypeError):
+        return value
+
+
 # --- reads -------------------------------------------------------------------------
 
 
@@ -568,6 +770,99 @@ def all_runs(limit: int | None = 100) -> list[RunInfo]:
         .dicts()
     )
     return [_run_info(row) for row in query]
+
+
+def list_traces(limit: int = 100) -> list[SpanInfo]:
+    """The newest root agent spans, bounded by ``limit``.
+
+    Only roots are fetched, and their payload columns are deliberately left
+    unloaded: a list of 100 roots must not read 6 MiB of tool output. Use
+    ``trace(trace_key)`` when the root payload is needed. A trace whose root
+    row was dropped but whose children survived is intentionally absent here;
+    ``trace(trace_key)`` can still load it by key.
+    """
+    if not _ready() or limit <= 0:
+        return []
+    # Everything SpanInfo needs except the two potentially large payloads.
+    query = (
+        SpanRecord.select(
+            SpanRecord.span_key,
+            SpanRecord.trace_key,
+            SpanRecord.parent_span_key,
+            SpanRecord.kind,
+            SpanRecord.name,
+            SpanRecord.started_at,
+            SpanRecord.ended_at,
+            SpanRecord.duration_ms,
+            SpanRecord.status,
+            SpanRecord.error,
+            SpanRecord.sampled,
+        )
+        .where((SpanRecord.kind == "agent") & (SpanRecord.span_key == SpanRecord.trace_key))
+        .order_by(SpanRecord.started_at.desc(), SpanRecord.span_key.desc())
+        .limit(limit)
+        .dicts()
+    )
+    return [_span_info(row) for row in query]
+
+
+def trace(trace_key: str) -> TraceInfo:
+    """One trace's ordered spans and linked model runs; ValueError if unknown.
+
+    Three bounded read phases: spans for the trace, linked runs in key-sized
+    batches, and check labels in batches. Missing parents, a missing root, or
+    a pruned linked run are tolerated rather than reconstructed. The returned
+    spans are flat and ordered by start time with a stable key tie-breaker.
+    """
+    if not _ready():
+        raise ValueError(f"no trace found for trace_key {trace_key!r}")
+    span_rows = list(
+        SpanRecord.select()
+        .where(SpanRecord.trace_key == trace_key)
+        .order_by(SpanRecord.started_at, SpanRecord.span_key)
+        .dicts()
+    )
+    if not span_rows:
+        raise ValueError(f"no trace found for trace_key {trace_key!r}")
+
+    # Linked model runs, grouped by span. The run projection is shared with
+    # the existing run reads; span_key is selected only to group and removed
+    # before RunInfo is built. Chunked for the same SQLite parameter limit as
+    # labels(), rather than one query per span.
+    span_keys = [row["span_key"] for row in span_rows]
+    runs_by_span: dict[str, list[RunInfo]] = {}
+    for start in range(0, len(span_keys), _KEYS_PER_QUERY):
+        chunk = span_keys[start : start + _KEYS_PER_QUERY]
+        run_rows = (
+            RunRecord.select(*_RUN_COLUMNS, _CONVERSATION_ID_COLUMN, RunRecord.span_key)
+            .join(PromptVersionRecord, pw.JOIN.LEFT_OUTER)
+            .join(PromptRecord, pw.JOIN.LEFT_OUTER)
+            .switch(RunRecord)
+            .join(ConversationRecord, pw.JOIN.LEFT_OUTER)
+            .where(RunRecord.span_key.in_(chunk))
+            .order_by(RunRecord.id)
+            .dicts()
+        )
+        for row in run_rows:
+            span_key = row.pop("span_key")
+            runs_by_span.setdefault(span_key, []).append(_run_info(row))
+
+    # Every run's labels in batched queries, then only the primary run's
+    # labels attach to its model span (checks stay filed under that run).
+    labels_by_run = labels([run.run_key for runs in runs_by_span.values() for run in runs])
+    spans = []
+    for row in span_rows:
+        runs = runs_by_span.get(row["span_key"], [])
+        primary_checks = labels_by_run.get(runs[0].run_key, []) if runs else []
+        spans.append(_span_info(row, runs=runs, checks=primary_checks))
+
+    # The root is an agent whose trace key is its own span key. Its absence
+    # is shown as None, not invented from the oldest child.
+    root = next(
+        (span for span in spans if span.kind == "agent" and span.span_key == span.trace_key),
+        None,
+    )
+    return TraceInfo(trace_key=trace_key, root=root, spans=spans)
 
 
 def stats(name: str) -> list[VersionStats]:

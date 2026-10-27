@@ -21,7 +21,7 @@ The public API is exactly this — everything else is internal, however it is re
 | `promptkeep` | every name in `promptkeep.__all__` |
 | `promptkeep.history` | every function and dataclass whose name has no leading underscore |
 | `promptkeep.integrations` | every name in `promptkeep.integrations.__all__` — including the `ProviderAdapter` interface a third-party adapter implements |
-| Public classes | their methods, properties and attributes without a leading underscore (`Prompt`, `RenderedText`, `RunHandle` as `response.promptkeep`, `CallResult`, `Verdict`, `CheckContext`, `Dataset`, and the `history` dataclasses) |
+| Public classes | their methods, properties and attributes without a leading underscore (`Prompt`, `RenderedText`, `RunHandle` as `response.promptkeep`, `CallResult`, `Verdict`, `CheckContext`, `Dataset`, `SpanInfo`, `TraceInfo`, and the other `history` dataclasses) |
 | Call-site kwargs | `promptkeep_conversation=`, `promptkeep_parent=`, `promptkeep_pre=`, `promptkeep_post=` on a wrapped client |
 | Configuration | every `configure()` argument and every `PROMPTKEEP_*` environment variable |
 | The CLI | command names and flags. Output is for people: its layout may change in any release. For machines, use `promptkeep export` (JSONL) |
@@ -46,12 +46,35 @@ Some behaviour is API too. Changing any of these is a breaking change, treated a
 - **Rendering is lenient by default.** Unknown placeholders pass through; strict is opt-in.
 - **Wrapping is transparent.** A wrapped client returns the provider's own response objects;
   promptkeep only adds `response.promptkeep`.
+- **Trace keys identify attempts, not rows.** `agent()` and `tool()` handles expose their
+  `span_key` before entry, and a root exposes `trace_key` after entry. Sampling, redaction,
+  a full queue, `write_mode="off"`, or a failed write can still drop the row; a key never
+  proves that persistence succeeded.
+- **Traces are allowed to be partial.** A missing root, parent, linked run, or payload is
+  reported as missing rather than reconstructed. `history.trace()` raises `ValueError` only
+  for a key with no surviving spans. A caught tool/provider failure is a child failure; it
+  does not rewrite the root's exit status. `history.list_traces()` returns root metadata
+  without payloads; `history.trace()` loads the payloads and children.
+- **Span payloads are bounded and redacted.** Agent/tool names, input, output, and error text
+  go through the configured `redact` hook before queueing. One serialized payload is capped
+  at 64 KiB before a visible truncation marker is appended; the cap bounds the serialized
+  value, not the cost of serializing an arbitrary object. Omitted output is distinct from
+  an explicitly recorded JSON `null`.
+- **Sampling keeps traces coherent where it can.** A root's cohort is chosen once and shared
+  by its normal model steps; errors, blocks, and non-ok known verdicts still force a
+  problem-only trace. A call explicitly moved to another conversation follows that
+  conversation's cohort, and its model link may be missing. Earlier successful steps already
+  dropped are not recovered, and a late async verdict cannot restore them.
+- **Retention expires traces whole.** The scheduled sweep uses the latest span or linked-run
+  activity, so a recent child keeps the trace alive and an abandoned running root eventually
+  expires. Prompt/version rows survive; conversation pruning can remove a linked run before
+  its trace expires, and the remaining span then reads as run-unavailable.
 
 ### Result types grow
 
-The `history` dataclasses (`RunInfo`, `ConversationInfo`, ...) and `Dataset` are results you
-read. Any release may add fields to them (at the end, with a default) and that is not a
-breaking change. Building them yourself is not supported.
+The `history` dataclasses (`RunInfo`, `ConversationInfo`, `SpanInfo`, `TraceInfo`, ...) and
+`Dataset` are results you read. Any release may add fields to them (at the end, with a
+default) and that is not a breaking change. Building them yourself is not supported.
 
 ## The database file
 

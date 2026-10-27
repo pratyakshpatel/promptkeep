@@ -420,19 +420,22 @@ class RunHandle:
     """Attached to a response as ``response.promptkeep``.
 
     Carries the run's key (its identity — pass it to ``history.checks()``),
-    the prompt version that ran, and the check results. ``wait()`` blocks for
-    async post-checks if you need their verdicts. run_key is None when the
-    run was not recorded (tracking disabled, write_mode "off", or sampled out
-    by ``sample_rate``); the checks still ran and the verdicts are still here.
+    the prompt version that ran, the check results, and the model span key
+    when the call happened inside an agent trace. ``wait()`` blocks for async
+    post-checks if you need their verdicts. run_key is None when the run was
+    not recorded (tracking disabled, write_mode "off", or sampled out by
+    ``sample_rate``); the checks still ran and the verdicts are still here.
     """
 
-    def __init__(self, run_key, prompt_version, results, futures=None):
+    def __init__(self, run_key, prompt_version, results, futures=None, span_key=None):
         """Bind the run's key, the prompt version that ran, the verdicts known
-        so far, and the futures of any async post-checks still running."""
+        so far, the futures of any async post-checks still running, and the
+        model span this physical call belongs to (None outside a trace)."""
         self.run_key = run_key
         self.prompt_version = prompt_version
         self.checks = list(results)
         self._futures = futures or []
+        self.span_key = span_key
 
     @property
     def verification(self) -> str:

@@ -178,6 +178,53 @@ convo.replay(upto=run_key)       # any other branch
 `replay()` follows one branch, so a reply that was regenerated away is not replayed as if
 the model had seen it. A conversation nobody branched reads exactly as before.
 
+## Agent traces
+
+A conversation groups messages; an agent trace groups the work around one task.
+Wrap the task in `agent()` and each application-executed tool in `tool()`; a wrapped
+model call inside either one becomes a linked `llm` span. No provider tool protocol is
+parsed, and the scope never invokes your tool or decides whether to await it:
+
+```python
+with promptkeep.agent("research", input={"question": question}) as task:
+    with promptkeep.tool("web_search", input={"query": query}) as search:
+        results = web_search(query)
+        search.output(results)              # omitted output means "not recorded"
+
+    response = client.chat.completions.create(...)
+    task.output(response.choices[0].message.content)
+
+promptkeep.flush()                          # default background mode: drain the queue
+trace = history.trace(task.trace_key)
+trace.status                                # root exit; None if its row is missing
+trace.spans                                 # agent, tool and llm spans in start order
+trace.error_count                           # caught child failures/blocks, separate from root exit
+trace.total_tokens, trace.total_cost        # counted once per physical model call
+trace.cost_complete                         # False when some call reported no cost
+trace.versions_used                         # {"REVIEW_SYSTEM": [4]}
+```
+
+`async with promptkeep.agent(...)` / `async with promptkeep.tool(...)` work the same way.
+A tool must be entered inside an agent; entering one without it is a usage error. Nested
+agents and tools stay in the same trace, and a model call inside a tool is that tool's
+child. The handle exposes `span_key` immediately; `trace_key` is known after entry. Keys
+identify attempts, not rows: sampling, redaction, a full queue or `write_mode="off"` can
+drop the row. `history.list_traces(limit=100)` lists root agent spans only.
+
+A caught tool/provider error is a child failure, not a root failure. A trace can be
+partial by design: a missing root, parent, or linked run is reported as missing, never
+reconstructed. Agent/tool names, input, output and errors go through `redact` before
+queueing; each payload is capped at 64 KiB with a visible marker. Sampling chooses one
+cohort for the trace's normal model steps and still keeps errors, blocks and non-ok
+verdicts, so a sampled-out task that hits a problem can appear as a problem-only trace.
+Retention expires spans in whole traces using their latest activity; prompt/version rows
+are never deleted.
+
+Context follows normal `contextvars` inheritance (including async tasks), not arbitrary
+threads or processes. Enter a new scope inside each thread. A child task or stream started
+inside a scope keeps the captured trace even if it finishes after the root; await/close it
+before leaving the root when you want the root's status and duration to cover it.
+
 ## Checks
 
 Run your own function before a call (a gate that can stop it) and after it (an
@@ -354,6 +401,8 @@ history.stats("REVIEW_SYSTEM")               # per version: runs, errors, pass r
 history.list_prompts()                       # every prompt + version/run counts
 history.list_conversations()                 # every session + turn counts
 history.list_conversations(prompt="REVIEW_SYSTEM", version=4)   # sessions v4 drove
+history.list_traces()                        # newest root agent spans, bounded (no payloads)
+history.trace(task.trace_key)                # one task's spans, payloads + linked runs
 history.all_runs()                           # everything, newest first
 ```
 
@@ -440,15 +489,19 @@ promptkeep.configure(
 whose checks returned something other than `ok` are always stored. Inside a conversation
 the decision is made once per session (derived from the session's id, so every worker
 process agrees), so a kept conversation is complete rather than full of holes. `0.0` means
-"store only problems". Version lineage is never sampled. Because the decision is made when
-the run is recorded, a verdict from an *async* post-check can't rescue a dropped run — use
-`mode="blocking"` for a check whose failures must always be kept. A sampled-out run's
-`response.promptkeep.run_key` is `None`; its verdicts are still on the handle.
+"store only problems". An agent trace uses one cohort for its root and normal model steps;
+errors, blocks and non-ok known verdicts can still leave a problem-only trace, without
+recovering earlier steps that were already dropped. Version lineage is never sampled.
+Because the decision is made when the run is recorded, a verdict from an *async* post-check
+can't rescue a dropped run — use `mode="blocking"` for a check whose failures must always be
+kept. A sampled-out run's `response.promptkeep.run_key` is `None`; its verdicts are still on
+the handle.
 
 **Redaction** runs before anything is written, in every write mode — plaintext never even
 enters the background queue. The hook sees each stored text field of a run (rendered prompt,
-input and output, the JSON-encoded variables and request params, error text) and of a check
-verdict (message, rewritten text). Templates, prompt names and conversation metadata are not
+input and output, the JSON-encoded variables and request params, error text), of a check
+verdict (message, rewritten text), and of an agent span (name, input/output payload, error).
+Templates, prompt names and conversation metadata are not
 passed through it: templates are code, and the metadata is what you attached on purpose. If
 the hook raises or returns a non-string, the row is dropped rather than stored unredacted.
 `redact=lambda text: ""` keeps metadata only — model, tokens, cost, latency, status and
@@ -457,8 +510,9 @@ verdicts, with no prompt or response text at all.
 **Retention** deletes recorded history once it is older than `retention_days`. A
 conversation is deleted whole, once its *last* turn is that old, so a session still in use
 never loses its opening turns; a run outside any conversation goes by its own age; verdicts
-and feedback go with their run. Prompts and versions are never deleted — they are your
-code's history, not your traffic's. The sweep rides the write path: at most once an hour per
+and feedback go with their run. Agent spans expire in whole traces based on the latest span
+or linked-run activity, so a running root does not live forever. Prompts and versions are
+never deleted — they are your code's history, not your traffic's. The sweep rides the write path: at most once an hour per
 process, starting with the first run recorded, on the writer thread in background mode. A
 failed sweep is logged and retried an hour later, and never costs a run. SQLite reuses the
 freed space; to shrink the file itself, run `VACUUM` on it.

@@ -66,8 +66,8 @@ def set_sink(sink: Sink) -> None:
 
 
 def submit(item: dict[str, Any]) -> None:
-    """Enqueue one item (a run row or a late verdict) for the background
-    thread; never blocks, never raises.
+    """Enqueue one item (a run row, verdict, span, or prune marker) for the
+    background thread; never blocks, never raises.
 
     On overflow the oldest queued item is discarded (and counted) to make
     room — recent telemetry is worth more than old telemetry.

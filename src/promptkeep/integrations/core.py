@@ -34,7 +34,15 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
-from .. import storage
+from .. import controls, storage
+from ..agents import (
+    current as current_agent,
+)
+from ..agents import (
+    finalize_model_span,
+    new_span_key,
+    utcnow,
+)
 from ..checks import (
     Check,
     CheckContext,
@@ -232,6 +240,20 @@ class _Call:
 
     def __init__(self, adapter: ProviderAdapter, kwargs: dict[str, Any]) -> None:
         """Parse the call and reserve everything it needs. No provider I/O."""
+        # Snapshot the ambient trace before anything can change it. A frame
+        # from another database, or one inherited across a fork, is not a
+        # valid association for this call; ordinary recording follows the
+        # current configuration in that case.
+        context = current_agent()
+        if context is not None and (
+            not context.tracked or str(get_settings().db_path) != context.db_path
+        ):
+            context = None
+        self.agent_context = context
+        self.model_span_key: str | None = None
+        self.model_started_at: str | None = None
+        self.model_sampled: bool | None = None
+
         # promptkeep's kwargs never reach the provider; take them off first.
         external_id, title, metadata = _resolve_conversation(kwargs)
         explicit_parent = _parent_key(kwargs.pop("promptkeep_parent", None))
@@ -259,13 +281,35 @@ class _Call:
         )
         self.checked = bool(self.pre_checks or self.post_checks)
 
+        # One model span per physical call. Its successful-span decision is
+        # the trace cohort, except when this call explicitly moves to another
+        # conversation: then that conversation's existing cohort applies and
+        # a dropped model link stays honestly missing from the trace.
+        if self.agent_context is not None:
+            self.model_span_key = new_span_key()
+            self.model_started_at = utcnow()
+            cohort = None
+            if (
+                self.conversation_id is None
+                or self.agent_context.trace.conversation_id is None
+                or self.conversation_id == self.agent_context.trace.conversation_id
+            ):
+                cohort = self.agent_context.trace.sampled
+            self.model_sampled = controls.keep_run(
+                get_settings(), {"status": "ok"}, self.conversation_id, cohort=cohort
+            )
+
         # A call that records gets its identity now, and the handle that will
         # carry it back on the response. When several prompts ride one call
         # both refer to the first — the row the verdicts are filed under.
         tracked = self.request.tracked
         self.version: int | None = tracked[0][0].version if tracked else None
         self.run_key: str | None = new_run_key() if self.records else None
-        self.handle: RunHandle | None = RunHandle(None, self.version, []) if self.records else None
+        self.handle: RunHandle | None = (
+            RunHandle(None, self.version, [], span_key=self.model_span_key)
+            if self.records
+            else None
+        )
 
         # Filled in by run_pre() for a checked call.
         self.outcome = PreOutcome()
@@ -276,8 +320,14 @@ class _Call:
     @property
     def records(self) -> bool:
         """Whether this call produces a run row at all: a tracked Prompt, a
-        conversation turn, or a checked call (whose row anchors its verdicts)."""
-        return bool(self.request.tracked) or self.conversation_id is not None or self.checked
+        conversation turn, a checked call (whose row anchors its verdicts), or
+        a call inside an active trace."""
+        return (
+            bool(self.request.tracked)
+            or self.conversation_id is not None
+            or self.checked
+            or self.agent_context is not None
+        )
 
     @property
     def streaming(self) -> bool:
@@ -416,6 +466,15 @@ class _Call:
             return None
         verdicts = self.outcome.results if results is None else results
         check_rows = [r.to_row() for r in verdicts] or None
+        # If the configured database changed during the call, the run rows
+        # follow the new database but must not carry a key from the old
+        # trace. The model span itself is skipped by finalize_model_span.
+        span_key = self.model_span_key
+        if (
+            self.agent_context is not None
+            and str(get_settings().db_path) != self.agent_context.db_path
+        ):
+            span_key = None
         common: dict[str, Any] = dict(
             provider=self.adapter.provider,
             latency_ms=latency_ms,
@@ -426,18 +485,56 @@ class _Call:
             input_text=self.request.input_text,
             original_input_text=self.original_input_text,
             parent_run_key=self.parent_run_key,
+            span_key=span_key,
+            cohort=self.model_sampled,
             **_row_fields(self.request, fields),
         )
         tracked = self.request.tracked
         if not tracked:
-            return _record_bare(run_key=self.run_key, checks=check_rows, **common)
+            run_key = _record_bare(run_key=self.run_key, checks=check_rows, **common)
+            self._finalize_model_span(status, error, check_rows, latency_ms)
+            return run_key
         (prompt_obj, variables, rendered), *rest = tracked
         run_key = record_prompt_run(
             prompt_obj, variables, rendered, run_key=self.run_key, checks=check_rows, **common
         )
         for prompt_obj, variables, rendered in rest:
             record_prompt_run(prompt_obj, variables, rendered, **common)
+        self._finalize_model_span(status, error, check_rows, latency_ms)
         return run_key
+
+    def _finalize_model_span(
+        self,
+        status: str,
+        error: str | None,
+        check_rows: list[dict[str, Any]] | None,
+        latency_ms: int,
+    ) -> None:
+        """Record this call's one model span after its run rows are written.
+
+        All four call paths converge on ``_write`` (non-streaming, streaming,
+        provider error, and blocked), so this is the only model-span
+        finalization site. It uses the context snapshotted at call start, not
+        the ambient context at stream completion, and the same latency the run
+        row carries so the span describes the provider call, not the writes
+        that followed it.
+        """
+        if (
+            self.agent_context is None
+            or self.model_span_key is None
+            or self.model_started_at is None
+        ):
+            return
+        finalize_model_span(
+            self.agent_context,
+            span_key=self.model_span_key,
+            started_at=self.model_started_at,
+            duration_ms=latency_ms,
+            status=status,
+            error=error,
+            sampled=bool(self.model_sampled),
+            checks=check_rows,
+        )
 
 
 # --- request-side helpers ------------------------------------------------------------
